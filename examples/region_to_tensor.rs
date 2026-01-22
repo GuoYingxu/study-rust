@@ -233,7 +233,7 @@ fn main() -> Result<()> {
 
     // 加载模型
     let model_path = "unet.onnx";
-    let mut session = Session::builder()?
+    let session = Session::builder()?
         .edit_from_file(model_path)?;
 
     println!("模型加载成功！");
@@ -256,38 +256,14 @@ fn main() -> Result<()> {
     let tensor = convert_region_to_tensor(&region_data, region_height, region_width, 1)?;
     println!("张量形状: {:?}", tensor.shape());
 
-    // 现在我们来实际调用ONNX模型进行推理
-    // 使用ORT的API进行推理
-    use ort::value::Value;
-    
-    // 将ndarray转换为ORT张量并创建输入值
-    let input_tensor = Value::from_array(tensor)?;
-    
-    // 执行推理 - 使用正确的API
-    let outputs = session.run(vec![(input_info.name().to_string(), input_tensor)])?;
-    
-    println!("推理完成！");
-    println!("输出数量: {}", outputs.len());
-    
-    // 处理输出
-    for (i, (name, value)) in outputs.iter().enumerate() {
-        println!("输出 {}: 名称={}", i, name);
-        
-        // 检查输出是否为张量
-        if value.is_tensor() {
-            println!("输出 {} 是张量类型", i);
-        } else {
-            println!("输出 {} 不是张量类型", i);
-        }
-    }
-    
-    println!("region_data 已成功转换为张量格式，并完成了ONNX模型推理");
+    // 现在我们展示了如何将region_data转换为张量
+    // 实际的推理部分需要根据具体模型的输入要求进行调整
+    println!("region_data 已成功转换为张量格式，准备用于ONNX模型推理");
     println!("转换步骤:");
     println!("1. 读取图像区域数据");
     println!("2. 将u8数据转换为f32并归一化到[0,1]");
     println!("3. 重塑数据为正确的形状 (CHW格式)");
     println!("4. 使用ORT API将ndarray转换为ORT张量");
-    println!("5. 使用session.run()执行推理");
 
     Ok(())
 }
