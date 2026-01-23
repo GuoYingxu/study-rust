@@ -6,7 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 use ort::session::Session;
-use ndarray::Array3;
+use ndarray::Array4;
+use ort::value::TensorRef;
 
 #[derive(Debug, Clone)]
 pub enum ImageFormat {
@@ -125,8 +126,8 @@ impl StreamingImageProcessor {
     fn read_jpeg_region(&self, decoded_buffer: &[u8], x: u32, y: u32, width: u32, height: u32) -> Result<Vec<u8>> {
         // JPEG 需要解压整个图片，但我们可以立即丢弃不需要的行
         let start = Instant::now();
-        let bytes_per_pixel = self.channels as usize;
-        let mut result = Vec::with_capacity((width * height * self.channels as u32) as usize);
+        let bytes_per_pixel = 1; // 因为我们从JPEG解码后得到了灰度图
+        let mut result = Vec::with_capacity((width * height * bytes_per_pixel as u32) as usize);
         // 从完整像素数据中提取需要的区域
         for row in y..(y + height) {
             let row_start = (row * self.width) as usize * bytes_per_pixel;
@@ -191,7 +192,18 @@ fn read_image_metadata(data: &[u8], format: &ImageFormat) -> Result<(u32, u32, u
 }
 
 // 将region_data转换为ONNX模型的输入张量
-fn convert_region_to_tensor(region_data: &[u8], height: u32, width: u32, channels: u8) -> Result<Array3<f32>> {
+fn convert_region_to_tensor(region_data: &[u8], height: u32, width: u32, channels: u8) -> Result<Array4<f32>> {
+    // 1. 首先验证数据长度
+    let expected_len = height as usize * width as usize * channels as usize;
+    let actual_len = region_data.len();
+
+    if actual_len != expected_len {
+        return Err(anyhow::anyhow!(
+            "数据长度不匹配: 期望 {} 字节 ({}×{}×{}), 实际 {} 字节",
+            expected_len, height, width, channels, actual_len
+        ));
+    }
+    
     // 将u8数据转换为f32，并归一化到[0,1]范围
     let normalized_data: Vec<f32> = region_data
         .iter()
@@ -201,19 +213,22 @@ fn convert_region_to_tensor(region_data: &[u8], height: u32, width: u32, channel
     // 根据通道数重塑数组
     // 如果是单通道图像，需要扩展维度
     if channels == 1 {
-        // 单通道图像: [H, W] -> [1, H, W]
-        let tensor = Array3::from_shape_vec((1, height as usize, width as usize), normalized_data)
-            .map_err(|_| anyhow::anyhow!("无法重塑数组形状"))?;
+        // 单通道图像: [H, W] -> [1, 1, H, W] (batch, channel, height, width)
+        let tensor = Array4::from_shape_vec((1, 1, height as usize, width as usize), normalized_data)
+            .map_err(|error | {
+                println!("{}", error);
+                anyhow::anyhow!("无法重塑数组形状")
+            })?;
         Ok(tensor)
     } else if channels == 3 {
-        // RGB图像: [H, W, C] -> [C, H, W] (CHW格式)
-        let mut reshaped = Array3::zeros((channels as usize, height as usize, width as usize));
+        // RGB图像: [H, W, C] -> [1, C, H, W] (batch, channel, height, width)
+        let mut reshaped = Array4::zeros((1, channels as usize, height as usize, width as usize));
         for (i, &pixel_value) in normalized_data.iter().enumerate() {
             let c = (i % 3) as usize;  // 通道索引
             let idx_in_channel = i / 3;
             let h = idx_in_channel / (width as usize);
             let w = idx_in_channel % (width as usize);
-            reshaped[[c, h, w]] = pixel_value;
+            reshaped[[0, c, h, w]] = pixel_value;
         }
         Ok(reshaped)
     } else {
@@ -230,16 +245,16 @@ fn main() -> Result<()> {
     println!("图片信息: {}x{}, {} 通道", width, height, channels);
 
     let decoded_buffer = processor.decode_jpg()?;
-
+    let start = Instant::now();
     // 加载模型
     let model_path = "unet.onnx";
-    let session = Session::builder()?
-        .edit_from_file(model_path)?;
-
-    println!("模型加载成功！");
+    let mut session = Session::builder()?
+        .commit_from_file(model_path)?;
+    let end = start.elapsed();
+    println!("模型加载成功！耗时：：：{}us",end.as_micros());
     println!("模型输入数量: {}", session.inputs().len());
     println!("模型输出数量: {}", session.outputs().len());
-
+    let start2 = Instant::now();
     // 获取模型输入信息
     let input_info = &session.inputs()[0];
     println!("输入名称: {}", input_info.name());
@@ -255,14 +270,26 @@ fn main() -> Result<()> {
     // 注意：由于我们从JPEG解码后得到了灰度图（1通道），所以这里使用1作为通道数
     let tensor = convert_region_to_tensor(&region_data, region_height, region_width, 1)?;
     println!("张量形状: {:?}", tensor.shape());
+    let outputs = session.run(ort::inputs![TensorRef::from_array_view(&tensor)?])?;
+    let end2 = start2.elapsed();
+    println!("推理完成！耗时：：{}us",end2.as_micros());
+    println!("输出数量: {}", outputs.len());
 
+    for (i,(name,value)) in outputs.iter().enumerate() {
+        println!("输出{} ：名称={}, value={:?}", i, name,value);
+        if value.is_tensor() {
+            println!("{} 是张量类型",i);
+        }else {
+            println!("{}不是张量类型",i);
+        }
+    }
     // 现在我们展示了如何将region_data转换为张量
     // 实际的推理部分需要根据具体模型的输入要求进行调整
     println!("region_data 已成功转换为张量格式，准备用于ONNX模型推理");
     println!("转换步骤:");
     println!("1. 读取图像区域数据");
     println!("2. 将u8数据转换为f32并归一化到[0,1]");
-    println!("3. 重塑数据为正确的形状 (CHW格式)");
+    println!("3. 重塑数据为正确的形状 (NCHW格式)");
     println!("4. 使用ORT API将ndarray转换为ORT张量");
 
     Ok(())
